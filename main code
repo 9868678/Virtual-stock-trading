@@ -1,0 +1,405 @@
+import yfinance as yf
+import time
+from datetime import datetime, timedelta
+from colorama import init, Fore
+import threading
+import pandas as pd
+import numpy as np
+
+init(autoreset=True)
+
+class FinancialInstrument:
+    def __init__(self, 名称, 代码, 类型="股票", 杠杆上限=1):
+        self.名称 = 名称
+        self.代码 = 代码
+        self.类型 = 类型
+        self.杠杆上限 = 杠杆上限
+        self.价格 = 0
+        self.涨跌幅 = 0
+        self.最高价 = 0
+        self.最低价 = float('inf')
+        self.成交量 = 0
+        self.更新时间 = None
+        self.K线数据 = pd.DataFrame()
+        self.更新价格()
+
+    def 更新价格(self):
+        try:
+            数据源 = yf.Ticker(self.代码)
+            self.K线数据 = 数据源.history(period='1d', interval='1m')
+            if not self.K线数据.empty:
+                最新价格 = self.K线数据['Close'].iloc[-1]
+                self.成交量 = int(self.K线数据['Volume'].iloc[-1])
+                if self.价格 != 0:
+                    self.涨跌幅 = (最新价格 - self.价格) / self.价格 * 100
+                self.价格 = 最新价格
+                self.最高价 = self.K线数据['High'].max()
+                self.最低价 = self.K线数据['Low'].min()
+                self.更新时间 = datetime.now()
+                self.计算技术指标()
+                return True
+            return False
+        except Exception as e:
+            print(f"更新{self.名称}价格失败: {e}")
+            return False
+
+    def 计算技术指标(self):
+        价格序列 = self.K线数据['Close']
+        # MA5
+        self.MA5 = 价格序列.rolling(window=5).mean().iloc[-1]
+        # MA10
+        self.MA10 = 价格序列.rolling(window=10).mean().iloc[-1]
+        # RSI
+        涨跌 = 价格序列.diff()
+        上涨 = 涨跌.clip(lower=0).rolling(window=14).mean()
+        下跌 = (-涨跌.clip(upper=0)).rolling(window=14).mean()
+        self.RSI = (100 * 上涨 / (上涨 + 下跌)).iloc[-1]
+
+class TraderAccount:
+    def __init__(self, 初始资金=1000000):
+        self.资金 = 初始资金
+        self.初始资金 = 初始资金
+        self.持仓 = {}
+        self.交易记录 = []
+        self.止盈止损订单 = []
+
+    def 买入(self, 品种, 数量, 杠杆=1, 止盈价=None, 止损价=None):
+        if 数量 <= 0:
+            raise Exception("购买数量必须大于0")
+        if 杠杆 > 品种.杠杆上限:
+            raise Exception(f"杠杆倍数不能超过{品种.杠杆上限}")
+
+        成本 = 品种.价格 * 数量 / 杠杆
+        手续费 = 成本 * 0.0003  # 0.03%手续费
+        保证金 = 成本 / 杠杆  # 计算所需保证金
+
+        if 保证金 + 手续费 > self.资金:
+            raise Exception("资金不足")
+
+        self.资金 -= (保证金 + 手续费)
+        持仓信息 = {
+            "数量": 数量,
+            "开仓价": 品种.价格,
+            "杠杆": 杠杆,
+            "方向": "多头"
+        }
+
+        if 品种.名称 not in self.持仓:
+            self.持仓[品种.名称] = []
+        self.持仓[品种.名称].append(持仓信息)
+
+        if 止盈价 or 止损价:
+            self.止盈止损订单.append({
+                "品种": 品种.名称,
+                "持仓索引": len(self.持仓[品种.名称]) - 1,
+                "止盈价": 止盈价,
+                "止损价": 止损价
+            })
+
+        交易记录 = {
+            "类型": "买入",
+            "品种": 品种.名称,
+            "数量": 数量,
+            "价格": 品种.价格,
+            "杠杆": 杠杆,
+            "手续费": 手续费,
+            "时间": datetime.now()
+        }
+        self.交易记录.append(交易记录)
+        print(f"{Fore.GREEN}买入成功: {品种.名称} {数量}股，价格：¥{品种.价格:.2f}，杠杆：{杠杆}倍，手续费：¥{手续费:.2f}")
+
+    def 卖出(self, 品种, 持仓索引):
+        if 品种.名称 not in self.持仓 or 持仓索引 >= len(self.持仓[品种.名称]):
+            raise Exception("未找到指定持仓")
+
+        持仓信息 = self.持仓[品种.名称][持仓索引]
+        数量 = 持仓信息["数量"]
+        开仓价 = 持仓信息["开仓价"]
+        杠杆 = 持仓信息["杠杆"]
+
+        收入 = 品种.价格 * 数量
+        手续费 = 收入 * 0.0003  # 0.03%手续费
+        印花税 = 收入 * 0.001   # 0.1%印花税
+
+        # 计算盈亏
+        if 持仓信息["方向"] == "多头":
+            盈亏 = (品种.价格 - 开仓价) * 数量 * 杠杆
+        else:
+            盈亏 = (开仓价 - 品种.价格) * 数量 * 杠杆
+
+        self.资金 += (收入 / 杠杆 + 盈亏 - 手续费 - 印花税)
+
+        # 删除持仓
+        del self.持仓[品种.名称][持仓索引]
+        if not self.持仓[品种.名称]:
+            del self.持仓[品种.名称]
+
+        # 删除相关的止盈止损订单
+        self.止盈止损订单 = [订单 for 订单 in self.止盈止损订单 
+                      if not (订单["品种"] == 品种.名称 and 订单["持仓索引"] == 持仓索引)]
+
+        交易记录 = {
+            "类型": "卖出",
+            "品种": 品种.名称,
+            "数量": 数量,
+            "价格": 品种.价格,
+            "盈亏": 盈亏,
+            "手续费": 手续费,
+            "印花税": 印花税,
+            "时间": datetime.now()
+        }
+        self.交易记录.append(交易记录)
+        print(f"{Fore.GREEN}卖出成功: {品种.名称} {数量}股，价格：¥{品种.价格:.2f}，盈亏：¥{盈亏:.2f}")
+
+    def 做空(self, 品种, 数量, 杠杆=1, 止盈价=None, 止损价=None):
+        if 品种.类型 != "期货" and 品种.类型 != "外汇":
+            raise Exception("该品种不支持做空")
+        if 数量 <= 0:
+            raise Exception("做空数量必须大于0")
+        if 杠杆 > 品种.杠杆上限:
+            raise Exception(f"杠杆倍数不能超过{品种.杠杆上限}")
+
+        成本 = 品种.价格 * 数量 / 杠杆
+        手续费 = 成本 * 0.0003
+        保证金 = 成本 / 杠杆
+
+        if 保证金 + 手续费 > self.资金:
+            raise Exception("资金不足")
+
+        self.资金 -= (保证金 + 手续费)
+        持仓信息 = {
+            "数量": 数量,
+            "开仓价": 品种.价格,
+            "杠杆": 杠杆,
+            "方向": "空头"
+        }
+
+        if 品种.名称 not in self.持仓:
+            self.持仓[品种.名称] = []
+        self.持仓[品种.名称].append(持仓信息)
+
+        if 止盈价 or 止损价:
+            self.止盈止损订单.append({
+                "品种": 品种.名称,
+                "持仓索引": len(self.持仓[品种.名称]) - 1,
+                "止盈价": 止盈价,
+                "止损价": 止损价
+            })
+
+        交易记录 = {
+            "类型": "做空",
+            "品种": 品种.名称,
+            "数量": 数量,
+            "价格": 品种.价格,
+            "杠杆": 杠杆,
+            "手续费": 手续费,
+            "时间": datetime.now()
+        }
+        self.交易记录.append(交易记录)
+        print(f"{Fore.GREEN}做空成功: {品种.名称} {数量}单位，价格：¥{品种.价格:.2f}，杠杆：{杠杆}倍")
+
+    def 检查止盈止损(self, 金融品种字典):
+        for 订单 in self.止盈止损订单[:]:  # 创建副本进行迭代
+            品种 = 金融品种字典[订单["品种"]]
+            持仓信息 = self.持仓[订单["品种"]][订单["持仓索引"]]
+
+            if 持仓信息["方向"] == "多头":
+                if 订单["止盈价"] and 品种.价格 >= 订单["止盈价"]:
+                    print(f"{Fore.YELLOW}触发止盈: {订单['品种']}")
+                    self.卖出(品种, 订单["持仓索引"])
+                elif 订单["止损价"] and 品种.价格 <= 订单["���损价"]:
+                    print(f"{Fore.RED}触发止损: {订单['品种']}")
+                    self.卖出(品种, 订单["持仓索引"])
+            else:  # 空头
+                if 订单["止盈价"] and 品种.价格 <= 订单["止盈价"]:
+                    print(f"{Fore.YELLOW}触发止盈: {订单['品种']}")
+                    self.卖出(品种, 订单["持仓索引"])
+                elif 订单["止损价"] and 品种.价格 >= 订单["止损价"]:
+                    print(f"{Fore.RED}触发止损: {订单['品种']}")
+                    self.卖出(品种, 订单["持仓索引"])
+
+    def 查看收益(self, 金融品种字典):
+        总市值 = 0
+        未实现盈亏 = 0
+
+        for 品种名称, 持仓列表 in self.持仓.items():
+            品种 = 金融品种字典[品种名称]
+            for 持仓 in 持仓列表:
+                市值 = 持仓["数量"] * 品种.价格
+                if 持仓["方向"] == "多头":
+                    盈亏 = (品种.价格 - 持仓["开仓价"]) * 持仓["数量"] * 持仓["杠杆"]
+                else:
+                    盈亏 = (持仓["开仓价"] - 品种.价格) * 持仓["数量"] * 持仓["杠杆"]
+                总市值 += 市值
+                未实现盈亏 += 盈亏
+
+        总资产 = self.资金 + 总市值
+        收益率 = (总资产 - self.初始资金) / self.初始资金 * 100
+        return 总市值, 总资产, 收益率, 未实现盈亏
+
+def 主程序():
+    金融品种列表 = {
+        "阿里巴巴": FinancialInstrument("阿里巴巴", "BABA", "股票", 2),
+        "腾讯": FinancialInstrument("腾讯", "0700.HK", "股票", 2),
+        "特斯拉": FinancialInstrument("特斯拉", "TSLA", "股票", 2),
+        "苹果": FinancialInstrument("苹果", "AAPL", "股票", 2),
+        "英伟达": FinancialInstrument("英伟达", "NVDA", "股票", 2),
+    }
+
+    账户 = TraderAccount()
+
+    def 更新市场数据():
+        while True:
+            for 品种 in 金融品种列表.values():
+                品种.更新价格()
+                time.sleep(1)
+            账户.检查止盈止损(金融品种列表)
+            time.sleep(5)
+
+    更新线程 = threading.Thread(target=更新市场数据, daemon=True)
+    更新线程.start()
+
+    while True:
+        print(f"\n{Fore.YELLOW}===== 实时市场行情 =====")
+        print(f"更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        for 品种 in 金融品种列表.values():
+            涨跌符号 = "↑" if 品种.涨跌幅 > 0 else "↓" if 品种.涨跌幅 < 0 else "→"
+            涨跌颜色 = Fore.RED if 品种.涨跌幅 > 0 else Fore.GREEN if 品种.涨跌幅 < 0 else Fore.WHITE
+            print(f"{品种.名称}({品种.类型}): {涨跌颜色}¥{品种.价格:.2f} {涨跌符号} {品种.涨跌幅:.2f}% MA5:{品种.MA5:.2f} RSI:{品种.RSI:.1f}")
+
+        总市值, 总资产, 收益率, 未实现盈亏 = 账户.查看收益(金融品种列表)
+        print(f"\n{Fore.CYAN}===== 账户信息 =====")
+        print(f"可用资金: ¥{账户.资金:,.2f}")
+        print(f"总市值: ¥{总市值:,.2f}")
+        print(f"未实现盈亏: ¥{未实现盈亏:,.2f}")
+        print(f"总资产: ¥{总资产:,.2f}")
+        print(f"收益率: {收益率:+.2f}%")
+
+        if 账户.持仓:
+            print("\n当前持仓:")
+            for 品种名称, 持仓列表 in 账户.持仓.items():
+                品种 = 金融品种列表[品种名称]
+                for i, 持仓 in enumerate(持仓列表):
+                    方向 = "做多" if 持仓["方向"] == "多头" else "做空"
+                    市值 = 持仓["数量"] * 品种.价格
+                    if 持仓["方向"] == "多头":
+                        盈亏 = (品种.价格 - 持仓["开仓价"]) * 持仓["数量"] * 持仓["杠杆"]
+                    else:
+                        盈亏 = (持仓["开仓价"] - 品种.价格) * 持仓["数量"] * 持仓["杠杆"]
+                    盈亏率 = 盈亏 / (市值 / 持仓["杠杆"]) * 100
+                    print(f"{品种名称} #{i}: {方向} {持仓['数量']}单位 开仓价:¥{持仓['开仓价']:.2f} "
+                          f"当前价:¥{品种.价格:.2f} 杠杆:{持仓['杠杆']}倍 盈亏:¥{盈亏:,.2f}({盈亏率:+.2f}%)")
+
+        print(f"\n{Fore.GREEN}===== 操作菜单 =====")
+        print("1. 开仓")
+        print("2. 平仓")
+        print("3. 查看K线")
+        print("4. 查看交易记录")
+        print("5. 添加新股票")
+        print("6. 退出程序")
+
+        选择 = input("\n请输入选项: ")
+
+        if 选择 == "1":
+            print("\n可交易的品种:")
+            for i, (名称, 品种) in enumerate(金融品种列表.items(), 1):
+                print(f"{i}. {名称}({品种.类型}) 最大杠杆:{品种.杠杆上限}倍")
+            品种序号 = input("请输入品种序号: ")
+            try:
+                品种名称 = list(金融品种列表.keys())[int(品种序号)-1]
+                品种 = 金融品种列表[品种名称]
+
+                方向 = input("请选择方向(1:做多 2:做空): ")
+                数量 = int(input("请输入数量: "))
+                杠杆 = int(input(f"请输入杠杆倍数(1-{品种.杠杆上限}): "))
+
+                止盈价 = float(input("请输入止盈价(0表示不设置): ") or 0)
+                止损价 = float(input("请输入止损价(0表示不设置): ") or 0)
+
+                if 方向 == "1":
+                    账户.买入(品种, 数量, 杠杆, 
+                          止盈价 if 止盈价 > 0 else None,
+                          止损价 if 止损价 > 0 else None)
+                elif 方向 == "2":
+                    账户.做空(品种, 数量, 杠杆,
+                          止盈价 if 止盈价 > 0 else None,
+                          止损价 if 止损价 > 0 else None)
+            except (ValueError, IndexError) as e:
+                print(f"{Fore.RED}输入无效")
+            except Exception as e:
+                print(f"{Fore.RED}交易失败: {e}")
+
+        elif 选择 == "2":
+            if not 账户.持仓:
+                print(f"{Fore.RED}没有可平仓的持仓")
+                continue
+            print("\n当前持仓:")
+            持仓列表 = []
+            序号 = 1
+            for 品种名称, 持仓列表 in 账户.持仓.items():
+                品种 = 金融品种列表[品种名称]
+                for i, 持仓 in enumerate(持仓列表):
+                    方向 = "做多" if 持仓["方向"] == "多头" else "做空"
+                    print(f"{序号}. {品种名称} #{i}: {方向} {持仓['数量']}单位 "
+                          f"开仓价:¥{持仓['开仓价']:.2f} 杠杆:{持仓['杠杆']}倍")
+                    持仓列表.append((品种名称, i))
+                    序号 += 1
+
+            持仓序号 = input("请输入要平仓的序号: ")
+            try:
+                选择持仓 = 持仓列表[int(持仓序号)-1]
+                品种名称, 持仓索引 = 选择持仓
+                账户.卖出(金融品种列表[品种名称], 持仓索引)
+            except (ValueError, IndexError) as e:
+                print(f"{Fore.RED}输入无效")
+            except Exception as e:
+                print(f"{Fore.RED}平仓失败: {e}")
+
+        elif 选择 == "3":
+            print("\n可查看的品种:")
+            for i, (名称, 品种) in enumerate(金融品种列表.items(), 1):
+                print(f"{i}. {名称}")
+            品种序号 = input("请输入品种序号: ")
+            try:
+                品种名称 = list(金融品种列表.keys())[int(品种序号)-1]
+                品种 = 金融品种列表[品种名称]
+                print(f"\n{品种名称}最近K线数据:")
+                print(品种.K线数据.tail())
+            except (ValueError, IndexError):
+                print(f"{Fore.RED}输入无效")
+
+        elif 选择 == "4":
+            if not 账户.交易记录:
+                print(f"{Fore.YELLOW}暂无交易记录")
+                continue
+            print(f"\n{Fore.CYAN}===== 交易记录 =====")
+            for 记录 in 账户.交易记录:
+                时间 = 记录["时间"].strftime("%Y-%m-%d %H:%M:%S")
+                if "盈亏" in 记录:
+                    print(f"{时间} {记录['类型']} {记录['品种']} {记录['数量']}单位 "
+                          f"价格:¥{记录['价格']:.2f} 盈亏:¥{记录['盈亏']:.2f}")
+                else:
+                    print(f"{时间} {记录['类型']} {记录['品种']} {记录['数量']}单位 "
+                          f"价格:¥{记录['价格']:.2f} 杠杆:{记录['杠杆']}倍")
+
+        elif 选择 == "5":
+            代码 = input("请输入股票代码(例如: BABA, 0700.HK): ")
+            名称 = input("请输入股票名称: ")
+            类型 = input("请输入类型(股票/期货/外汇): ")
+            杠杆上限 = int(input("请输入最大杠杆倍数: "))
+            try:
+                新品种 = FinancialInstrument(名称, 代码, 类型, 杠杆上限)
+                if 新品种.更新价格():  # 测试是否能获取价格
+                    金融品种列表[名称] = 新品种
+                    print(f"{Fore.GREEN}添加成功: {名称}({代码})")
+                else:
+                    print(f"{Fore.RED}添加失败: 无法获取价格数据")
+            except Exception as e:
+                print(f"{Fore.RED}添加失败: {e}")
+
+        elif 选择 == "6":
+            print(f"{Fore.YELLOW}感谢使用，再见！")
+            break
+
+if __name__ == "__main__":
+    主程序()
